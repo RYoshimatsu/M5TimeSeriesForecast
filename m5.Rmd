@@ -1,0 +1,528 @@
+---
+title: "M5"
+author: "Ryuta Yoshimatsu"
+output:
+  html_document: 
+    number_sections: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Libraries
+
+```{r packages, message = FALSE}
+library(statsr)
+library(dplyr)
+library(MASS)
+library(BAS)
+library(ggplot2)
+library(devtools)
+library(gridExtra)
+library(grid)
+library(GGally)
+library(PreProcess)
+library(tidyverse)
+library(knitr)
+
+library(TTR)
+library(forecast)
+library(lubridate)
+library(mltools)
+library(data.table)
+library(ggplotify)
+library(gridBase)
+library(tsibble)
+library(fable)
+#library(prophet)
+```
+
+# Helper Function
+
+```{r}
+# Function to plot Normal QQ
+qqplot.data <- function (vec) # argument: vector of numbers
+{
+  y <- quantile(vec[!is.na(vec)], c(0.25, 0.75))
+  x <- qnorm(c(0.25, 0.75))
+  slope <- diff(y)/diff(x)
+  int <- y[1L] - slope * x[1L]
+  d <- data.frame(resids = vec)
+  ggplot(d, aes(sample = resids)) + stat_qq() + geom_abline(slope = slope, intercept = int) + xlab("Theoretical Quantiles") + ylab("Sample Quantiles")
+}
+```
+
+# First Look at the Data
+
+```{r load, message = FALSE}
+calendar <- read.csv("calendar.csv")
+sell_price <- read.csv("sell_prices.csv")
+evaluation <- read.csv("sales_train_evaluation.csv")
+validation <- read.csv("sales_train_validation.csv")
+```
+
+```{r}
+str(validation[,1:10])
+dim(validation)
+str(evaluation[,1:10])
+dim(evaluation)
+```
+
+
+```{r}
+tail(calendar)  # d_1969
+dim(validation) # d_1913
+dim(evaluation) # d_1941
+str(validation[, 1:10]) # first 6 are explanatory variables
+```
+
+# Exporatory Analysis
+
+## Total Sales
+
+Create time series object and plot it.
+
+```{r}
+total <- validation %>% dplyr::select(-id, -item_id, -dept_id, -cat_id, -store_id, -state_id) %>% summarise(across(everything(), list(sum)))
+total <- t(total[,1:ncol(total)])
+total.ts <- msts(total, seasonal.periods=c(7, 30.4167, 365.25))
+
+total.eval <- evaluation %>% dplyr::select(-id, -item_id, -dept_id, -cat_id, -store_id, -state_id) %>% summarise(across(everything(), list(sum)))
+total.eval <- t(total.eval[,1:ncol(total.eval)])
+total.eval.ts <- msts(total.eval, seasonal.periods=c(7, 30.4167, 365.25))
+```
+
+Smooth the series to get an insight about the general trend.
+
+```{r, fig.width=15, fig.height=5}
+# Moving Average
+total.sma <- ts(SMA(total.ts, n=30.4167))
+par(mfrow = c(1, 2))
+ts.plot(total, total.sma, gpars=list(col = c("black", "red")))
+```
+
+Check if there is any significant dependence structures in the series.
+
+```{r, fig.width=5, fig.height=5}
+c(total.ts) %>% ggtsdisplay(main='', theme=theme_bw(), lag.max=30)
+```
+
+```{r, fig.width=7.5, fig.height=7.5}
+total.ts %>% mstl() %>% autoplot()
+```
+
+### Holt-Winters & ETS: Exponential Smoothing with Annual Seasonality
+
+Holt-Winters only takes one seasonality in to account, which in this case will be the anual seasonamlity. 
+
+```{r,fig.width=15, fig.height=5, warning=FALSE, message=FALSE}
+total.hw <- HoltWinters(total.ts)
+total.hw.forecasts <- forecast:::forecast.HoltWinters(total.hw, h=28)
+par(mfrow=c(1, 2))
+plot(total.hw, xlim=c(4.0, 6.238356))
+plot.new()
+vps <- baseViewports()
+pushViewport(vps$figure)
+vp1 <-plotViewport(c(1,1,1,1))
+f <- autoplot(total.hw.forecasts) + autolayer(total.eval.ts, series="Data") + autolayer(total.hw.forecasts$mean, series="Forecasts") + xlim(6.238356, 6.312329)
+print(f, vp=vp1)
+```
+
+Run residual analysis to check the fit.
+
+```{r,fig.width=5, fig.height=5}
+# Plot residuals
+na.omit(total.hw.forecasts$residuals) %>% ggtsdisplay(lag.max=20, main='Residual', theme=theme_bw())
+
+# Run Ljung-Box test (null hypothesis: there is no non-zero autocorrelation in the in-sample forecast errors)
+Box.test(total.hw.forecasts$residuals, lag=20, type="Ljung-Box")
+
+# Plot histogram of residuals
+ggplot() + aes(as.numeric(na.omit(total.hw.forecasts$residuals)))+geom_histogram(aes(y=..density..), bins=30, alpha=0.75, color='blue', fill='blue') + geom_density()
+
+# Plot QQ plot
+qqplot.data(as.numeric(na.omit(total.hw.forecasts$residuals)))
+```
+
+It looks like there are still some statistically significant structures in the residuals. Now we try stlf() from forecast: https://robjhyndman.com/hyndsight/estimation2/#:~:text=HoltWinters()%20is%20using%20heuristic,for%20the%20linear%20additive%20models). 
+
+```{r,fig.width=15, fig.height=5, warning=FALSE, message=FALSE}
+total.ets <- stlf(total.ts)
+total.ets.forecasts <- forecast(total.ets, h=28)
+par(mfrow=c(1, 2))
+plot(total.ets.forecasts$x, xlim=c(4.0, 6.238356), col="black")
+lines(total.ets.forecasts$fitted, col="red")
+plot.new()
+vps <- baseViewports()
+pushViewport(vps$figure)
+vp1 <-plotViewport(c(1,1,1,1))
+f <- autoplot(total.ets.forecasts) + autolayer(total.eval.ts, series="Data") + autolayer(total.ets.forecasts$mean, series="Forecasts") + xlim(6.238356, 6.312329)
+print(f, vp=vp1)
+```
+
+```{r, fig.height=5, fig.width=5, warning=FALSE, message=FALSE}
+checkresiduals(total.ets)
+sum(total.ets$residuals^2)
+```
+
+### Simple ARIMA with Annual Seasonality
+
+Simple ARIMA model only allows one frequency.
+
+```{r}
+total.arima <- ts(total, frequency=365.25)
+total.simple.arima <- auto.arima(total.arima, D=1, stationary=FALSE, seasonal=TRUE, ic="bic", stepwise=FALSE)
+summary(total.simple.arima)
+total.simple.arima.forecasts <- forecast(total.simple.arima, h=28)
+```
+
+```{r, fig.width=15, fig.height=5, warning=FALSE, message=FALSE}
+par(mfrow=c(1, 2))
+plot(total.simple.arima$x, xlim=c(4.0, 6.238356), col="black")
+lines(fitted(total.simple.arima), col="red")
+plot.new()
+vps <- baseViewports()
+pushViewport(vps$figure)        ## I am in the space of the base plot
+vp1 <-plotViewport(c(1,1,1,1))  ## Create new vp with margins
+f <- autoplot(total.simple.arima.forecasts) + autolayer(total.eval.ts, series="Data") + autolayer(total.simple.arima.forecasts$mean, series="Forecasts") + xlim(6.238356, 6.312329)
+print(f, vp=vp1)
+```
+
+```{r, fig.height=5, fig.width=5}
+checkresiduals(total.simple.arima)
+sum(total.simple.arima$residuals^2)
+```
+
+### ARIMA with Weekly, Monthly and Annual Seasonalities and Fourier Terms (i,j,k)
+
+https://robjhyndman.com/hyndsight/forecasting-weekly-data/
+https://pkg.robjhyndman.com/forecast/reference/fourier.html
+https://otexts.com/fpp2/dhr.html#dhr
+
+The smoothness of the seasonal pattern can be controlled by K (the number of Fourier sin and cos pairs – the seasonal pattern is smoother for smaller values of K).
+
+```{r, fig.width=15, fig.height=5}
+start_time <- Sys.time()
+bestfit <- list(aicc=Inf)
+for(i in 1:3)
+  for(j in 1:5)
+    for(k in 1:5)
+    {
+      fit <- auto.arima(total.ts, xreg=fourier(total.ts, K=c(i,j,k)), stationary=FALSE, seasonal=FALSE)
+      if(fit$aicc < bestfit$aicc)
+        bestfit <- fit
+      else break;
+    }
+end_time <- Sys.time()
+end_time - start_time
+summary(bestfit)
+```
+
+```{r, fig.width=15, fig.height=5, warning=FALSE, message=FALSE}
+total.arima.forecasts <- forecast(bestfit, xreg=fourier(total.ts, K=c(2,3,2), h=28))
+
+par(mfrow=c(1, 2))
+plot(bestfit$x, xlim=c(4.0, 6.238356), col="black")
+lines(fitted(bestfit), col="red")
+plot.new()
+vps <- baseViewports()
+pushViewport(vps$figure)        ## I am in the space of the base plot
+vp1 <-plotViewport(c(1,1,1,1))  ## Create new vp with margins
+f <- autoplot(total.arima.forecasts) + autolayer(total.eval.ts, series="Data") + autolayer(total.arima.forecasts$mean, series="Forecasts") + xlim(6.238356, 6.312329)
+print(f, vp=vp1)
+```
+
+```{r, fig.height=5, fig.width=5}
+checkresiduals(bestfit)
+sum(bestfit$residuals^2)
+```
+
+### ARIMA with Multiple Seasonalities (Weekly, Monthly and Annual), Fourier Terms (i,j,k) and Special Days (e.g. Holidays)
+
+https://stackoverflow.com/questions/46873899/weekly-forecasts-with-holidays
+
+```{r, fig.width=15, fig.height=5}
+events <- calendar %>% dplyr::select(weekday, event_name_1, snap_CA, snap_TX, snap_WI)
+events$saturday <- 0
+events$saturday[events$weekday=='Saturday'] <- 1
+events$saturday <- as.integer(events$saturday)
+events <- events %>% dplyr::select(-weekday)
+events <- as.data.frame(model.matrix( ~ . -1, events))
+event   <- events[1:1913,]
+eventf  <- events[1914:1969,]
+
+# Extend the forecast period to one year
+for (i in 1:309)
+{
+  year_ago <- as.integer(1604+i)
+  eventf <- rbind(eventf, event[year_ago,])
+}
+rownames(eventf) <- 1914:as.integer(1914+nrow(eventf)-1)
+
+h <- nrow(eventf)
+
+fourier_terms <- fourier(total.ts, K=c(2,5,3))
+fourier_terms_forecasts <- fourier(total.ts, K=c(2,5,3), h=h)
+
+xreg.fit <- data.matrix(cbind(fourier_terms, event))
+xreg.forecasts <- data.matrix(cbind(fourier_terms_forecasts, eventf))
+
+drop_collinear <- rownames(alias(lm(saturday ~ . , data=as.data.frame(xreg.fit)))$Complete)
+xreg.fit <- xreg.fit[, !colnames(xreg.fit) %in% drop_collinear]
+xreg.forecasts <- xreg.forecasts[, !colnames(xreg.forecasts) %in% drop_collinear]
+
+fit.holidays <- auto.arima(total.ts, xreg=xreg.fit, stationary=FALSE, seasonal=FALSE)
+total.arima.holidays.forecasts <- forecast(fit.holidays, xreg=xreg.forecasts, h=h)
+```
+
+```{r, fig.width=15, fig.height=5, warning=FALSE, message=FALSE}
+par(mfrow=c(1, 2))
+plot(fit.holidays$x, xlim=c(4.0, 6.238356), col="black")
+lines(fitted(fit.holidays), col="red")
+plot.new()
+vps <- baseViewports()
+pushViewport(vps$figure)        ## I am in the space of the base plot
+vp1 <-plotViewport(c(1,1,1,1))  ## Create new vp with margins
+f <- autoplot(total.arima.holidays.forecasts) + autolayer(total.eval.ts, series="Data") + autolayer(total.arima.holidays.forecasts$mean, series="Forecasts") + xlim(6.238356, 6.312329)
+print(f, vp=vp1)
+```
+
+```{r, fig.height=5, fig.width=5}
+checkresiduals(fit.holidays)
+sum(fit.holidays$residuals^2)
+```
+
+### TBATS
+
+https://robjhyndman.com/hyndsight/forecasting-weekly-data/
+https://robjhyndman.com/hyndsight/dailydata/
+
+```{r, fig.width=5, fig.height=7.5}
+total.tbats <- tbats(total.ts)
+plot(total.tbats)
+total.tbats.forecasts <- forecast(total.tbats, h=365)
+```
+
+```{r, fig.width=15, fig.height=5, warning=FALSE, message=FALSE}
+par(mfrow=c(1, 2))
+plot(total.ts, xlim=c(4.0, 6.238356), col="black")
+lines(total.tbats$fitted.values, col="red")
+plot.new()
+vps <- baseViewports()
+pushViewport(vps$figure)        ## I am in the space of the base plot
+vp1 <-plotViewport(c(1,1,1,1))  ## Create new vp with margins
+f <- autoplot(total.tbats.forecasts) + autolayer(total.eval.ts, series="Data") + autolayer(total.tbats.forecasts$mean, series="Forecasts") + xlim(6.238356, 6.312329)
+print(f, vp=vp1)
+```
+
+```{r, fig.height=5, fig.width=5}
+checkresiduals(total.tbats)
+sum(total.tbats$errors^2)
+```
+
+## Neural Network (nnetar)
+
+https://robjhyndman.com/hyndsight/nnetar-prediction-intervals/#:~:text=The%20nnetar%20function%20in%20the,to%20analytically%20derive%20prediction%20intervals.
+
+```{r, fig.width=15, fig.height=5, warning=FALSE, message=FALSE}
+total.nn <- nnetar(total.ts)
+#total.nn.forecasts <- forecast(total.nn, PI=TRUE, h=28)
+total.nn.forecasts <- forecast(total.nn, h=28)
+
+par(mfrow=c(1, 2))
+plot(total.nn.forecasts$x, xlim=c(4.0, 6.238356), col="black")
+lines(total.nn.forecasts$fitted, col="red")
+plot.new()
+vps <- baseViewports()
+pushViewport(vps$figure)
+vp1 <-plotViewport(c(1,1,1,1))
+f <- autoplot(total.nn.forecasts) + autolayer(total.eval.ts, series="Data") + autolayer(total.nn.forecasts$mean, series="Forecasts") + xlim(6.238356, 6.312329)
+print(f, vp=vp1)
+```
+
+```{r, fig.height=5, fig.width=5, warning=FALSE, message=FALSE}
+checkresiduals(total.nn)
+sum(total.nn$residuals^2)
+```
+
+## Prophet
+
+Having trouble loading the library...  
+
+## fable: Multiple 'Independent' Time Series
+
+https://stackoverflow.com/questions/58327544/forecast-multiple-time-series-in-r-using
+https://robjhyndman.com/hyndsight/fable/#:~:text=fable%20is%20designed%20for%20tsibble,point%20forecasts%20and%20prediction%20intervals.
+https://tidyverts.github.io/tidy-forecasting-principles/index.html
+
+```{r, fig.width=7.5, fig.height=15, warning=FALSE}
+
+# Time series stored in rows
+dept_id.df <- validation %>% dplyr::select(-id, -item_id, -cat_id, -store_id, -state_id)
+dept_id.df <- dept_id.df %>% group_by(dept_id) %>% summarise(across(everything(), list(sum)))
+df <- dept_id.df %>% remove_rownames %>% column_to_rownames(var="dept_id")
+dept_id <- as.data.frame(cbind(rownames(df), 1:7))
+dept_id <- dept_id %>% rename(Name=V1, Id=V2)
+dept_id$Id <- as.integer(dept_id$Id)
+
+# Column names are timestep
+colnames(df) <- seq(NCOL(df))
+
+# Convert df to tibble
+df <- df %>% as_tibble() 
+
+# Add column 'Id'
+df <- df %>% mutate(Id=1:nrow(df))
+
+# Take columns and collapses into key-value pairs
+df <- df %>% gather(key="time", value="value", -Id)
+df$time <- as.integer(df$time)
+
+# Redefine tsibble object 
+df <- df %>% as_tsibble(index=time, key=Id)
+
+# Evaluation data
+dept_id.df.eval <- evaluation %>% dplyr::select(-id, -item_id, -cat_id, -store_id, -state_id)
+dept_id.df.eval <- dept_id.df.eval %>% group_by(dept_id) %>% summarise(across(everything(), list(sum)))
+df.eval <- dept_id.df.eval %>% remove_rownames %>% column_to_rownames(var="dept_id")
+colnames(df.eval) <- seq(NCOL(df.eval))
+df.eval <- df.eval %>% as_tibble() 
+df.eval <- df.eval %>% mutate(Id=1:nrow(df.eval))
+df.eval <- df.eval %>% gather(key="time", value="value", -Id)
+df.eval$time <- as.integer(df.eval$time)
+df.eval <- df.eval %>% as_tsibble(index=time, key=Id)
+
+# Extrenal Regressors
+xreg.fit <- data.matrix(event)
+xreg.forecasts <- data.matrix(eventf)
+drop_collinear <- rownames(alias(lm(event_name_1 ~ . , data=as.data.frame(xreg.fit)))$Complete)
+xreg.fit <- xreg.fit[, !colnames(xreg.fit) %in% drop_collinear]
+xreg.forecasts <- xreg.forecasts[, !colnames(xreg.forecasts) %in% drop_collinear]
+
+# Fit models
+fit <- df %>% model(
+  snaive = SNAIVE(value ~ lag(7)),
+  ets = ETS(value ~ trend("A") + season("A", period=7) + error("A")),
+  arima=ARIMA(value ~ 1 + pdq(p=0:5, d=0:2, q=0:5, p_init=2, q_init=2) + PDQ(P=0, D=0, Q=0) + fourier(7, K=3) + fourier(30.4167, K=5) + fourier(365.25, K=5) + xreg(xreg.fit))
+) %>% mutate(mixed=(ets+arima+snaive)/3)
+
+# Compute forecasts
+forecasts <- forecast(fit, xreg=xreg.forecasts, h=28)
+
+# Plot forecasts for one series
+forecasts %>% autoplot(df.eval) + xlim(1875, 1945)
+```
+
+## LGBM
+
+## RNN/LSTM
+
+## Randomly Chosen `id`s
+
+## Vector ARIMA
+
+## Hierarichial Forecast
+
+
+```{r}
+set.seed(12345)
+random_ids <- sample(1:nrow(evaluation), 5)
+evaluation[c(random_ids), 1:6]
+id.df <- t(evaluation[c(random_ids), 7:ncol(evaluation)])
+for(i in 1:ncol(id.df))
+{
+  id.ts <- msts(id.df[,i], seasonal.periods=c(7, 30.4167, 365.25))
+  id.ts.sma <- ts(SMA(id.ts, n=30.4167), frequency=365)
+  ts.plot(id.ts, id.ts.sma, gpars=list(col = c("black", "red")))
+}
+```
+
+## Aggregate Over `item_id` and Select 5 Randomly
+
+```{r, fig.width=7.5, fig.height=5}
+set.seed(12345)
+item_id.df <- validation %>% dplyr::select(-id, -dept_id, -cat_id, -store_id, -state_id)
+item_id.df <- item_id.df %>% group_by(item_id) %>% summarise(across(everything(), list(sum)))
+random_item_ids <- sample(1:nrow(item_id.df), 5)
+item_id.df <- t(item_id.df[c(random_item_ids), 2:ncol(item_id.df)])
+```
+
+```{r}
+for(i in 1:ncol(id.df))
+{
+  item_id.ts <- msts(item_id.df[,i], seasonal.periods=c(7, 30.4167, 365.25))
+  item_id.ts.sma <- ts(SMA(item_id.ts, n=30.4167), frequency=365)
+  ts.plot(item_id.ts, item_id.ts.sma, gpars=list(col = c("black", "red")))
+}
+```
+
+## Aggregate over `dept_id`
+
+```{r}
+dept_id.df <- validation %>% dplyr::select(-id, -item_id, -cat_id, -store_id, -state_id)
+dept_id.df <- dept_id.df %>% group_by(dept_id) %>% summarise(across(everything(), list(sum)))
+dept_id.df <- t(dept_id.df[,2:ncol(dept_id.df)])
+```
+
+```{r}
+for(i in 1:ncol(dept_id.df))
+{
+  dept_id.ts <- msts(dept_id.df[,i], seasonal.periods=c(7, 30.4167, 365.25))
+  dept_id.ts.sma <- ts(SMA(dept_id.ts, n=30.4167), frequency=365)
+  ts.plot(dept_id.ts, dept_id.ts.sma, gpars=list(col = c("black", "red")))
+}
+```
+
+## Aggregate Over `cat_id`
+
+```{r}
+cat_id.df <- validation %>% dplyr::select(-id, -item_id, -dept_id, -store_id, -state_id)
+cat_id.df <- cat_id.df %>% group_by(cat_id) %>% summarise(across(everything(), list(sum)))
+cat_id.df <- t(cat_id.df[,2:ncol(cat_id.df)])
+```
+
+```{r}
+for(i in 1:ncol(cat_id.df))
+{
+  cat_id.ts <- msts(cat_id.df[,i], seasonal.periods=c(7, 30.4167, 365.25))
+  cat_id.ts.sma <- ts(SMA(cat_id.ts, n=30.4167), frequency=365)
+  ts.plot(cat_id.ts, cat_id.ts.sma, gpars=list(col = c("black", "red")))
+}
+```
+
+## Aggregate Over `store_id`
+
+```{r}
+store_id.df <- validation %>% dplyr::select(-id, -item_id, -dept_id, -cat_id, -state_id)
+store_id.df <- store_id.df %>% group_by(store_id) %>% summarise(across(everything(), list(sum)))
+store_id.df <- t(store_id.df[,2:ncol(store_id.df)])
+```
+
+```{r}
+for(i in 1:ncol(store_id.df))
+{
+  store_id.ts <- msts(store_id.df[,i], seasonal.periods=c(7, 30.4167, 365.25))
+  store_id.ts.sma <- ts(SMA(store_id.ts, n=30.4167), frequency=365)
+  ts.plot(store_id.ts, store_id.ts.sma, gpars=list(col = c("black", "red")))
+}
+```
+
+## Aggregate Over `state_id`
+
+```{r}
+state_id.df <- validation %>% dplyr::select(-id, -item_id, -dept_id, -cat_id, -store_id)
+state_id.df <- state_id.df %>% group_by(state_id) %>% summarise(across(everything(), list(sum)))
+state_id.df <- t(state_id.df[,2:ncol(state_id.df)])
+```
+
+```{r}
+for(i in 1:ncol(state_id.df))
+{
+  state_id.ts <- msts(state_id.df[,i], seasonal.periods=c(7, 30.4167, 365.25))
+  state_id.ts.sma <- ts(SMA(state_id.ts, n=30.4167), frequency=365)
+  ts.plot(state_id.ts, state_id.ts.sma, gpars=list(col = c("black", "red")))
+}
+```

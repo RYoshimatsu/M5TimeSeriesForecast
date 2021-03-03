@@ -1,0 +1,290 @@
+---
+title: "M5: LGBM"
+author: "Ryuta Yoshimatsu"
+output:
+  html_document: 
+    number_sections: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Libraries
+
+```{r packages, message = FALSE}
+library(data.table)
+library(Matrix)
+library(dplyr)
+library(MLmetrics)
+library(lightgbm)
+library(ggplot2)
+```
+
+```{r}
+set.seed(0)
+```
+
+```{r}
+h <- 28           # forecast horizon
+max_lags <- 366   # maximum number of observations to shift by (has to be at least greater than 365 days to have the same values when we factorize the event column in train and test)
+tr_last <- 1913   # last training day
+fday <- as.IDate("2016-04-25") # first day to forecast
+nrows <- Inf
+```
+
+```{r}
+free <- function() invisible(gc()) 
+```
+
+```{r}
+cal <- fread("calendar.csv")
+prices <- fread("sell_prices.csv")
+train <- fread("sales_train_evaluation.csv")
+# dim(validation) = (30490,1919): 1913 days  (d_1:d_1913)
+# dim(evaluation) = (30490,1947): 1941 days  (d_1:d_1941)
+```
+
+Prepare the training data table.
+
+```{r}
+# Prepare training data table
+cols <- train[, names(.SD), .SDcols = patterns("^d_")] # [d_1:d_1913]
+
+# Replace leading zeros with NA (why?)
+train[, (cols) := transpose(lapply(transpose(.SD),
+                                    function(x) {
+                                      i <- min(which(x > 0))
+                                      x[1:i-1] <- NA
+                                      return(x)})), .SDcols = cols]
+
+# Pivot the table and omit NA from the series
+train <- na.omit(melt(train, measure.vars = patterns("^d_"), variable.name = "d", value.name = "sales"))
+
+# Join with cal and create columns 'date', 'wm_yr_wk', 'event_name_1', 'snap_CA', 'snap_TX' and 'snap_WI'
+train[cal, `:=`(
+                  date = as.IDate(i.date, format="%Y-%m-%d"), # merge tables by d
+                  wm_yr_wk = i.wm_yr_wk,
+                  event_name_1 = i.event_name_1,
+                  snap_CA = i.snap_CA,
+                  snap_TX = i.snap_TX,
+                  snap_WI = i.snap_WI
+                ), on = "d"]
+
+# Join with prices and create a column 'sell_price'
+train[prices, sell_price := i.sell_price, on = c("store_id", "item_id", "wm_yr_wk")] # merge tables by "store_id", "item_id" and "wm_yr_wk"
+free()
+```
+
+Plot the total sales.
+
+```{r}
+train[, .(sales = unlist(lapply(.SD, sum))), by="date", .SDcols="sales"][, 
+        ggplot(.SD, aes(x=date, y=sales)) 
+        + geom_line(size=0.3, color="steelblue", alpha=0.8) 
+        + geom_smooth(method='lm', formula= y~x, se=FALSE, linetype=2, size=0.5, color="black") 
+        + geom_smooth(method='loess', formula= y~x, se=FALSE, linetype=2, size=0.5, color="red")
+        + labs(x="", y="total sales") 
+        + theme_minimal() 
+        + theme(axis.text.x=element_text(angle=45, hjust=1), legend.position="none") 
+        + scale_x_date(labels=scales::date_format ("%b %y"), breaks=scales::date_breaks("3 months"))]
+```
+
+Create lagged and rolling window features.
+
+```{r}
+create_features <- function(dt) {
+  
+  # Remove useless columns
+  dt[, `:=`(d=NULL, wm_yr_wk=NULL)]
+  
+  # Convert character columns to integer
+  cols <- c("item_id", "store_id", "state_id", "dept_id", "cat_id", "event_name_1") 
+  dt[, (cols) := lapply(.SD, function(x) as.integer(factor(x))), .SDcols = cols] 
+  free()
+  
+  # Add lag vectors: table must be sorted by date!
+  lags <- c(7, 28) 
+  lag_cols <- paste0("lag_", lags) # lag_7 and lag_28
+  dt[, (lag_cols) := shift(.SD, lags), by=id, .SDcols="sales"]
+  
+  # Add rolling window vectors: table must be sorted by date!
+  windows <- c(7, 28)
+  roll_cols <- paste0("rmean_", t(outer(lags, windows, paste, sep="_")))
+  dt[, (roll_cols) := frollmean(.SD, windows, na.rm=TRUE), by=id, .SDcols=lag_cols] # Rolling features on lag_cols
+  dt[, `:=`(
+              wday = wday(date), 
+              mday = mday(date),
+              week = week(date),
+              month = month(date),
+              year = year(date)
+            )
+        ]
+  free()
+  
+  # Remove rows with NA to save memory
+  dt <- na.omit(dt) 
+  free()
+  return(dt)
+}
+```
+
+```{r}
+# Create features
+train <- create_features(train)
+free()
+
+# Split the training data set into train and eval:
+#   train consist of data from "2011-01-29" to "2016-04-24" [d_1:d_1913]
+#   eval  consist of data from "2016-04-25" to "2016-05-22" [d_1914:d_1941]
+# Indices for the training set: date <= "2016-04-24", max(date) = "2016-05-22"
+idx <- train[date <= max(date)-h, which=TRUE]
+
+# Labels for the training set
+y <- train$sales
+
+# Drop columns "id", "sales" and "date"
+train[, c("id", "sales", "date") := NULL]
+free()
+```
+
+Convert a data frame to a numeric matrix: return the matrix obtained by converting all the variables in a data frame to numeric mode and then binding them together as the columns of a matrix.
+
+```{r}
+train <- data.matrix(train)
+free()
+```
+
+```{r}
+# List of categorical features
+cats <- c("item_id", "store_id", "state_id", "dept_id", "cat_id", "wday", "mday", "week", "month", "year", "snap_CA", "snap_TX", "snap_WI")
+
+# Construct lgb dataset
+xtrain <- lgb.Dataset(train[idx, ], label=y[idx], categorical_feature=cats) 
+xval <- lgb.Dataset(train[-idx, ], label=y[-idx], categorical_feature=cats)
+
+#rm(train, y, cats, idx)
+free()
+```
+
+We use Poisson regression (from generalize linear model family), which is suitable for counts. The model assumes the errors are Poission distributed and thus could capture a skew, discrete distribution, and the restriction to response variables to be non-negative.
+
+```{r}
+# Configure lgb hyper parameters 
+p <- list(objective = "poisson",  # Training parameter
+          metric ="rmse",         # Training parameter
+          force_row_wise = TRUE,  # Training parameter: force row-wise histogram building
+          learning_rate = 0.075,  # Training parameter
+          num_leaves = 128,       # Regularization parameter
+          min_data = 100,         # Regularization parameter
+          sub_feature = 0.8,      # Regularization parameter
+          sub_row = 0.75,         # Regularization parameter
+          bagging_freq = 1,       # Regularization parameter
+          lambda_l2 = 0.1,        # Regularization parameter
+          nthread = 2)            # Training parameter
+
+start_time <- Sys.time()
+model.lgb <- lgb.train(params = p,
+                   data = xtrain,
+                   nrounds = 4000,              # Training parameter (max number of trees)
+                   valids = list(val = xval),
+                   early_stopping_rounds = 400, # Training parameter (min number of trees to stop)
+                   eval_freq = 400)             # Training parameter
+end_time <- Sys.time()
+end_time - start_time
+```
+
+```{r}
+cat("Best score:", model.lgb$best_score, "at", model.lgb$best_iter, "iteration")
+```
+
+```{r}
+imp <- lgb.importance(model.lgb)
+rm(xtrain, xval, p)
+free()
+```
+
+```{r}
+imp[order(-Gain)
+    ][1:15, ggplot(.SD, aes(reorder(Feature, Gain), Gain)) +
+        geom_col(fill = "steelblue") +
+        xlab("Feature") +
+        coord_flip() +
+        theme_minimal()]
+```
+
+```{r}
+# Prepare testing data table
+# Keep only max_lags (420) days from the train set (d_1494:d_1913)
+test <- fread("sales_train_validation.csv", drop = paste0("d_", 1:(tr_last-max_lags)))
+
+# Add empty columns for forecasting (d_1914:d_1970)
+test[, paste0("d_", (tr_last+1):(tr_last+2*h)) := 0]
+
+# Pivot the table and omit NA from the series
+test <- na.omit(melt(test, measure.vars = patterns("^d_"), variable.name = "d", value.name = "sales"))
+
+# Merge calendar
+test <- test[cal, `:=`
+                  (
+                    date = as.IDate(i.date, format="%Y-%m-%d"),
+                    wm_yr_wk = i.wm_yr_wk,
+                    event_name_1 = i.event_name_1,
+                    snap_CA = i.snap_CA,
+                    snap_TX = i.snap_TX,
+                    snap_WI = i.snap_WI
+                  ), on = "d"]
+
+# Merge prices
+test[prices, sell_price := i.sell_price, on = c("store_id", "item_id", "wm_yr_wk")]
+free()
+```
+
+As we are using lag features we have to forecast day by day in order to use the latest predictions for the current day. This slows down the forecasting process tremendously. Also, tree models are unable to extrapolate that’s why here we use some kind of “magic” multiplier which slightly inflates predictions.
+
+```{r}
+# Loop through "2016-04-25" to "2016-06-19"
+start_time <- Sys.time()
+for (day in as.list(seq(fday, length.out = 2*h, by = "day"))){
+  
+  cat(as.character(day), '\n')
+  
+  # Take the subset of the data set only necessary for calculating lagged and rolling mean features for the day (56,420)
+  test.subset <- test[day-max_lags <= date & date <= day]
+  
+  # Create features
+  test.subset <- create_features(test.subset)
+  
+  # Construct a matrix only with the 'day'
+  test.subset <- data.matrix(test.subset[date == day][, c("id", "sales", "date") := NULL])
+  
+  # Update the sales column of the 'day' of the test data set with the prediction
+  test[date == day, sales := predict(model.lgb, test.subset)]
+  #test[date == day, sales := 1.03*predict(model.lgb, test.subset)]
+  
+  free()
+}
+end_time <- Sys.time()
+end_time - start_time
+```
+
+```{r}
+test[, .(sales = unlist(lapply(.SD, sum))), by = "date", .SDcols = "sales"
+   ][, ggplot(.SD, aes(x = date, y = sales, colour = (date < fday))) +
+       geom_line() + 
+       geom_smooth(method='lm', formula= y~x, se = FALSE, linetype = 2, size = 0.3, color = "gray20") + 
+       labs(x = "", y = "total sales") +
+       theme_minimal() +
+       theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position="none") +
+       scale_x_date(labels=scales::date_format ("%b %d"), breaks=scales::date_breaks("14 day"))]
+```
+
+```{r}
+test[date >= fday
+   ][date >= fday+h, id := sub("validation", "evaluation", id)
+     ][, d := paste0("F", 1:28), by = id
+       ][, dcast(.SD, id ~ d, value.var = "sales")
+         ][, fwrite(.SD, "submission_lgb.csv")]
+```
